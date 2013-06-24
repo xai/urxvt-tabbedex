@@ -150,6 +150,31 @@
 ## * Preserve -e option when creating new tabs (not only the first
 ##   one).
 ##
+## * Work around one or more bugs in urxvt V 9.12 which cause tabbed
+##   terminals to open up too small and to ignore X geometry
+##   resources.  These changes work for me with these choices:
+##
+##     fvwm2, Slackware64 13.37, my modified (narrowed) NeXT scrollbars.
+##
+##   I've tried a few other fonts, but the testing wasn't extensive.
+##   For other scrollbar widths, you need to modify a paramter; see
+##   the comments at the beginning of on_resize_all_windows().  Also,
+##   I used some mystery offsets that worked for me.  YMMV.  (See the
+##   comments and 5 and 27.)  NOTE: these changes work in 9.14 with
+##   either of the patches suggested on 2011/01/05 on the rxvt-unicode
+##   mailing list.  NOTE: these changes work in 9.15 with no patches
+##   applied.
+##
+## * The previous version of on_start() threw away all of @argv up to
+##   the "-e" (if it exists).  This tossed away arguments that I want,
+##   most notably "-ls" and "-geometry <geometry>.  The code below
+##   passes through everything except "-pe <arg>" and geometry.  If
+##   other options are found to be problematic they will need to be
+##   tossed too.  The other args are saved for all tabs, which may or
+##   may not be desired in the case of
+##
+##     urxvt -pe tabbedex -e <some command>
+##
 ## Added by 8ware:
 ##
 ## * Handling of special cases when moving a tab around, so first or
@@ -182,7 +207,9 @@ sub update_autohide {
       $self->{tabheight} = 0;
    }
    if ($reconfigure && $self->{tabheight} != $oldh) {
+      $self->{needs_fixing} = 1;
       $self->configure;
+      $self->on_resize_all_windows;
       $self->copy_properties;
    }
 }
@@ -327,10 +354,20 @@ sub refresh {
 
 sub new_tab {
    my ($self) = @_;
+   my $oldtabheight = $self->{tabheight};
 
    unless ($self->{autohide} &&
            !(defined $self->{tabs} && @{ $self->{tabs} })) {
       $self->{tabheight} = $self->{maxtabheight}
+   }
+
+   if ($oldtabheight != $self->{tabheight}) {
+       # We are about to use up a line for the tab bar.
+       # Stretch the (outer) window.
+       # Since the "needs fixing" code adds 1 to desired_rows
+       # if we have a tab we don't need to change it here.
+       $self->{needs_fixing} = 1;
+       $self->on_resize_all_windows;
    }
 
    # save a backlink to us, make sure tabbedex is inactive
@@ -553,6 +590,11 @@ sub register_keysyms {
 sub on_init {
    my ($self) = @_;
 
+   # This captures X resources but not a command-line geometry specification.
+   my $geom = $self->x_resource("geometry");
+   $self->{initial_geometry} = $geom;
+   $self->{initial_int_bwidth} = $self->int_bwidth;
+
    $self->{resource} = [map $self->resource ("+$_"),
                             0 .. urxvt::NUM_RESOURCES - 1];
 
@@ -623,10 +665,23 @@ sub on_start {
 
    $self->cmd_parse ("\033[?25l");
 
-   my @argv = $self->argv;
-   do {
-      shift @argv;
-   } while @argv && $argv[0] ne "-e";
+   # JD: don't throw away all arguments, as original code did.
+   # Instead, let most of them through.
+   # Q: What shouldn't we pass through aside from "-pe <extensions>"?
+   my @argv;
+   my @tmp = $self->argv;
+   shift @tmp;          # toss away argv[0] (== "urxvt" or similar).
+   while (@tmp) {
+       if ($tmp[0] =~ /^-(?:pe|w|b)$/) {
+           shift @tmp;  # toss away options we probably don't want to pass
+       } elsif ($tmp[0] eq "-geometry") {
+           shift @tmp;
+           $self->{initial_geometry} = $tmp[0];
+       } else {
+           push(@argv, $tmp[0]);
+       }
+       shift @tmp;
+   }
    $self->{argv} = \@argv;
 
    if ($self->{tab_title}) {
@@ -696,7 +751,7 @@ sub tab_destroy {
    }
 
    $self->{tabs} = [ grep $_ != $tab, @{ $self->{tabs} } ];
-   $self->update_autohide ();
+   $self->update_autohide (1);
 
    if (@{ $self->{tabs} }) {
       if ($self->{cur} == $tab) {
@@ -890,6 +945,71 @@ sub tab_osc_seq_perl {
         $self->refresh;
         1;
     }
+}
+
+
+sub on_resize_all_windows {
+    my ($self, $width, $height) = @_;
+
+   # In urxvt-9.12, the size as reported by $self->width apparently
+   # includes the space used by the scroll bar and other padding.
+   # I need to figure out how to calculate that in a robust way.
+   # But for my personal version of the NeXT scrollbars, the following
+   # seems to properly calculate the number of columns of text that
+   # are missing.
+   # (12 is the magic number I need to calculate.  This is apparently
+   # the width of the scroll bar.  Maybe.)
+   # TODO: take lineSpace and letterSpace into account.
+   my $sb_width = 12;
+   my $border_pixels = 2 * $self->{initial_int_bwidth} + $self->ext_bwidth;
+   my $cols_eaten_by_sb = int(($sb_width + $border_pixels + $self->fwidth - 1)
+                              / $self->fwidth);
+
+   if ($self->{needs_fixing}) {
+       my $selfterm = $self->{term};
+       my $selfparent = $self->parent;
+       my $rootwindow = $selfterm->DefaultRootWindow;
+       my $x;
+       my $y;
+
+       $self->{needs_fixing} = 0;
+
+       # Compute the diffs between what it should be and what it is.
+       my $row_delta = $self->{    desired_rows} - $self->{term}->nrow;
+       if ($self->{tabheight} > 0) {
+           $row_delta += 1;
+       }
+       my $col_delta = $self->{desired_cols} - $self->{term}->ncol
+           + $cols_eaten_by_sb;
+       if ($row_delta != 0 || $col_delta != 0) {
+       my $wid_delta = $col_delta * $self->fwidth;
+       my $ht_delta = $row_delta * $self->fheight;
+       # This only works for geometry specs whose X offset is of the form
+       # +\d++\d+
+       if ($self->{initial_geometry} =~ m/.*\+(.*)\+(.*)/) {
+           $x = $1 + 5;     # Why + 5?  Dunno.
+           $y = $2 + 27;    # Ditto.
+       } else {
+           ($x, $y) = $selfterm->XTranslateCoordinates($selfparent, $rootwindow,
+                                                       0, 0);
+       }
+       # We will never want this again.  Lose it.
+       $self->{initial_geometry} = "";
+       $self->XMoveResizeWindow($selfparent, $x, $y,
+                                $self->width + $wid_delta,
+                                $self->height + $ht_delta);
+       }
+   } else {
+       # The window changed size, (manually or because the tab bar was added).
+       # Record the new "desired" size.
+       $self->{desired_cols} = $self->{term}->ncol - $cols_eaten_by_sb;
+       $self->{desired_rows} = $self->{term}->nrow;
+       if ($self->{tabheight} > 0) {
+           $self->{desired_rows} -= 1;
+       }
+   }
+
+   1;
 }
 
 
