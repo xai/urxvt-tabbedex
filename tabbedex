@@ -331,6 +331,7 @@ sub tab_bell_active ($$$) {
 }
 
 sub tab_activity_mark ($$;$) {
+   return ' ';
    my ($self, $tab, $now) = @_;
    return ' ' unless defined $tab->{last_activity};
    return ' ' if $tab == $self->{cur};
